@@ -187,4 +187,5 @@ SUPPORTED_MODELS = [
     "qwen3-4b-think-FC",
     "qwen3-4b-nothink-FC",
     "DM-Cito-32B-v1",
+    "tusherbhomik/qwen2.5-1.5b-hgr-5340-r2"
 ]
