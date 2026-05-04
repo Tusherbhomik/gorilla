@@ -1,0 +1,235 @@
+"""
+tool_call_handler.py — Custom BFCL handler for Qwen2.5-based models fine-tuned
+on multi-turn tool-calling data with <tool_call>{...}</tool_call> output format.
+
+Design decisions driven by empirical BFCL results:
+  1. Pass RAW BFCL tool schemas (no OpenAI {"type":"function"} wrapper) so the
+     base-model behavior handles non-live/parallel correctly (+15% vs wrapped).
+  2. Convert parameters.type "dict" -> "object" so schemas match training data
+     distribution (training used OpenAI "object" schemas).
+  3. Preserve the `name` field on tool messages so multi-turn history is
+     structured the way Qwen's template expects.
+  4. Permissive <tool_call> regex (handles both newline and no-newline forms).
+  5. Strip dotted class prefixes for BFCL multi-turn (GorillaFileSystem.mv -> mv)
+     since BFCL executes flat method names against stateful instances.
+  6. Tokenizer is loaded once in __init__ to avoid per-call reload overhead
+     (this reduced per-call latency from ~128s to ~30s).
+"""
+import copy
+import json
+import re
+
+from bfcl_eval.model_handler.local_inference.base_oss_handler import OSSHandler
+from overrides import override
+
+
+class ToolCallHandler(OSSHandler):
+    """
+    Handler for Qwen2.5-Instruct models fine-tuned on tool-calling data that
+    emits <tool_call>{"name": ..., "arguments": ...}</tool_call> format.
+    """
+
+    def __init__(self, model_name, temperature, registry_name, is_fc_model, dtype="float16", **kwargs) -> None:
+        super().__init__(model_name, temperature, registry_name, is_fc_model, dtype=dtype, **kwargs)
+        self._tokenizer = None  # loaded lazily on first use; cached thereafter
+
+    def _ensure_tokenizer(self):
+        """Load tokenizer once and cache it. Uses model_name_huggingface."""
+        if self._tokenizer is not None:
+            return
+        from transformers import AutoTokenizer
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            self.model_name_huggingface,
+            trust_remote_code=True,
+        )
+        if self._tokenizer.pad_token is None:
+            self._tokenizer.pad_token = self._tokenizer.eos_token
+
+    @staticmethod
+    def _normalize_schema_types(tool):
+        """
+        BFCL schemas use 'dict' as the parameters type; training data used 'object'.
+        Recursively rewrite 'dict' -> 'object' so the schema Qwen sees at eval time
+        matches what the model learned during fine-tuning.
+        """
+        if not isinstance(tool, dict):
+            return tool
+        tool = copy.deepcopy(tool)
+
+        def walk(node):
+            if isinstance(node, dict):
+                if node.get("type") == "dict":
+                    node["type"] = "object"
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        walk(tool)
+        return tool
+
+    @staticmethod
+    def _normalize_tool_message(msg):
+        """
+        BFCL sometimes passes tool results without a `name` field. Training data
+        always had `{"role":"tool","name":"...","content":"..."}`. Qwen's chat
+        template is more reliable when the name is present.
+        """
+        if msg.get("role") != "tool":
+            return msg
+        msg = dict(msg)
+        if "name" not in msg or not msg["name"]:
+            msg["name"] = "tool"
+        # Ensure content is a string (training data had JSON-encoded strings)
+        if not isinstance(msg.get("content"), str):
+            try:
+                msg["content"] = json.dumps(msg["content"], ensure_ascii=False)
+            except Exception:
+                msg["content"] = str(msg.get("content", ""))
+        return msg
+
+    @override
+    def _format_prompt(self, messages, function, turn_type="single_turn"):
+        """
+        Render prompt using Qwen's chat template with RAW BFCL tool schemas
+        (no OpenAI wrapper), and 'dict' -> 'object' normalization to match training.
+        """
+        self._ensure_tokenizer()
+
+        # 1) Normalize tool messages (ensure name + stringified content)
+        norm_messages = [self._normalize_tool_message(m) for m in messages]
+
+        # 2) Build tool list — raw schema, just normalize dict->object
+        tools = function if isinstance(function, list) else [function]
+        tools = [self._normalize_schema_types(t) for t in tools if t is not None]
+
+        try:
+            prompt = self._tokenizer.apply_chat_template(
+                norm_messages,
+                tools=tools if tools else None,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception:
+            prompt = self._manual_qwen_format(norm_messages, tools)
+
+        return prompt
+
+    def _manual_qwen_format(self, messages, tools):
+        """Fallback Qwen-format prompt builder if apply_chat_template fails."""
+        parts = []
+
+        system_content = ""
+        if messages and messages[0].get("role") == "system":
+            system_content = messages[0]["content"]
+            messages = messages[1:]
+
+        if tools:
+            tool_spec = "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+            tool_spec += "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n"
+            for t in tools:
+                tool_spec += json.dumps(t, ensure_ascii=False) + "\n"
+            tool_spec += "</tools>\n\n"
+            tool_spec += "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
+            tool_spec += "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>"
+            system_content = (system_content + tool_spec).strip()
+
+        parts.append(f"<|im_start|>system\n{system_content}<|im_end|>\n")
+
+        for msg in messages:
+            role = msg["role"]
+            content = msg.get("content", "")
+            if role == "tool":
+                tool_name = msg.get("name", "tool")
+                parts.append(
+                    f"<|im_start|>user\n<tool_response>\n{tool_name}: {content}\n</tool_response><|im_end|>\n"
+                )
+            else:
+                parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+
+        parts.append("<|im_start|>assistant\n")
+        return "".join(parts)
+
+    @override
+    def decode_ast(self, result, language, has_tool_call_tag):
+        """Parse model output for AST-based evaluation (non-live / live)."""
+        tool_calls = self._extract_tool_calls(result)
+        decoded = []
+        for tc in tool_calls:
+            name = tc.get("name", "").strip()
+            if not name or name.lower() == "none":
+                continue
+            args = tc.get("arguments", tc.get("parameters", {}))
+            if not isinstance(args, dict):
+                args = {}
+            decoded.append({name: args})
+        return decoded
+
+    @override
+    def decode_execute(self, result, has_tool_call_tag):
+        """Parse model output for execution-based evaluation (multi-turn)."""
+        tool_calls = self._extract_tool_calls(result)
+        python_calls = []
+        for tc in tool_calls:
+            name = tc.get("name", "").strip()
+            if not name or name.lower() == "none":
+                continue
+            args = tc.get("arguments", tc.get("parameters", {}))
+            if not isinstance(args, dict):
+                args = {}
+
+            # BFCL multi-turn uses flat method names. Strip class prefix
+            # (GorillaFileSystem.mv -> mv) so eval() finds the bound method.
+            if "." in name:
+                name = name.split(".")[-1]
+
+            args_str = ", ".join(f"{k}={repr(v)}" for k, v in args.items())
+            python_calls.append(f"{name}({args_str})")
+
+        return python_calls
+
+    @staticmethod
+    def _extract_tool_calls(text):
+        """
+        Permissive extractor for <tool_call>{...}</tool_call> blocks.
+        Handles all of:
+          - <tool_call>\n{...}\n</tool_call>   (Qwen base model output)
+          - <tool_call>{...}</tool_call>        (fine-tuned training format)
+          - Multiple stacked blocks
+          - Extra whitespace / mixed newlines
+        """
+        if "<tool_call>" not in text:
+            return []
+
+        calls = []
+        pattern = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
+        for match in re.findall(pattern, text, re.DOTALL):
+            try:
+                obj = json.loads(match)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict) or "name" not in obj:
+                continue
+            if "arguments" not in obj and "parameters" in obj:
+                obj["arguments"] = obj["parameters"]
+            calls.append(obj)
+
+        # Fallback: split-based parsing (handles malformed whitespace edge cases,
+        # matches the approach used in rlla_qwen.py).
+        if not calls:
+            try:
+                segment = text.split("<tool_call>")[-1].split("</tool_call>")[0].strip()
+                for line in (l.strip() for l in segment.split("\n") if l.strip()):
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(obj, dict) and "name" in obj:
+                        if "arguments" not in obj and "parameters" in obj:
+                            obj["arguments"] = obj["parameters"]
+                        calls.append(obj)
+            except Exception:
+                pass
+
+        return calls
