@@ -14,7 +14,11 @@ Design decisions driven by empirical BFCL results:
      since BFCL executes flat method names against stateful instances.
   6. Tokenizer is loaded once in __init__ to avoid per-call reload overhead
      (this reduced per-call latency from ~128s to ~30s).
+  7. Python-syntax fallback parser for cases where the model emits
+     [func_name(arg=val), ...] notation instead of <tool_call> tags.
+     Only activates when <tool_call> parsing fails completely; safe fail-closed.
 """
+import ast
 import copy
 import json
 import re
@@ -114,6 +118,10 @@ class ToolCallHandler(OSSHandler):
         except Exception:
             prompt = self._manual_qwen_format(norm_messages, tools)
 
+        # Defensive: if chat template silently returned empty/None, fall back
+        if not prompt or not isinstance(prompt, str):
+            prompt = self._manual_qwen_format(norm_messages, tools)
+
         return prompt
 
     def _manual_qwen_format(self, messages, tools):
@@ -193,43 +201,135 @@ class ToolCallHandler(OSSHandler):
     def _extract_tool_calls(text):
         """
         Permissive extractor for <tool_call>{...}</tool_call> blocks.
-        Handles all of:
-          - <tool_call>\n{...}\n</tool_call>   (Qwen base model output)
-          - <tool_call>{...}</tool_call>        (fine-tuned training format)
-          - Multiple stacked blocks
-          - Extra whitespace / mixed newlines
+
+        Parsing order (each step only runs if previous found nothing):
+          1. Regex match on <tool_call>...</tool_call> blocks (primary path)
+          2. Split-based parsing of last <tool_call>...</tool_call> segment
+          3. Python-syntax fallback for [func(arg=val), ...] notation
+             (safety net for cases where the model drops the tags entirely)
         """
-        if "<tool_call>" not in text:
+        if not text or not isinstance(text, str):
             return []
 
         calls = []
-        pattern = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
-        for match in re.findall(pattern, text, re.DOTALL):
-            try:
-                obj = json.loads(match)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(obj, dict) or "name" not in obj:
-                continue
-            if "arguments" not in obj and "parameters" in obj:
-                obj["arguments"] = obj["parameters"]
-            calls.append(obj)
 
-        # Fallback: split-based parsing (handles malformed whitespace edge cases,
-        # matches the approach used in rlla_qwen.py).
+        # ── Step 1: Primary regex path ────────────────────────────────────────
+        if "<tool_call>" in text:
+            pattern = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
+            for match in re.findall(pattern, text, re.DOTALL):
+                try:
+                    obj = json.loads(match)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict) or "name" not in obj:
+                    continue
+                if "arguments" not in obj and "parameters" in obj:
+                    obj["arguments"] = obj["parameters"]
+                calls.append(obj)
+
+            # ── Step 2: Split-based fallback (only if regex found nothing) ──
+            if not calls:
+                try:
+                    segment = text.split("<tool_call>")[-1].split("</tool_call>")[0].strip()
+                    for line in (l.strip() for l in segment.split("\n") if l.strip()):
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(obj, dict) and "name" in obj:
+                            if "arguments" not in obj and "parameters" in obj:
+                                obj["arguments"] = obj["parameters"]
+                            calls.append(obj)
+                except Exception:
+                    pass
+
+        # ── Step 3: Python-syntax fallback ────────────────────────────────────
+        # Only fires when no <tool_call>-based parsing succeeded. This handles
+        # rare cases where the model emits Python call notation directly:
+        #   [find_prime_numbers(start=50, end=150), get_fibonacci_sequence(count=150)]
+        # Or single calls:
+        #   func_name(arg=value)
         if not calls:
-            try:
-                segment = text.split("<tool_call>")[-1].split("</tool_call>")[0].strip()
-                for line in (l.strip() for l in segment.split("\n") if l.strip()):
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(obj, dict) and "name" in obj:
-                        if "arguments" not in obj and "parameters" in obj:
-                            obj["arguments"] = obj["parameters"]
-                        calls.append(obj)
-            except Exception:
-                pass
+            calls = ToolCallHandler._parse_python_calls(text)
 
         return calls
+
+    @staticmethod
+    def _parse_python_calls(text):
+        """
+        Safely parse Python-style tool calls using ast. Returns [] on any failure.
+
+        Accepts:
+          - List of calls:  [func1(a=1), func2(b=2)]
+          - Single call:    func1(a=1)
+          - Dotted names:   module.func1(a=1)
+
+        Safety properties:
+          - Uses ast.parse(mode="eval") — no code execution
+          - Uses ast.literal_eval for argument values — only literals allowed
+          - Returns [] on any parse error or unexpected node type
+        """
+        if not text or not isinstance(text, str):
+            return []
+
+        candidate = text.strip()
+        if not candidate:
+            return []
+
+        # Heuristic: must look like a call expression. Reject prose to avoid
+        # accidentally matching natural language that happens to contain parens.
+        if "(" not in candidate or ")" not in candidate:
+            return []
+
+        # Wrap single calls in a list for unified parsing
+        if not candidate.startswith("["):
+            candidate = f"[{candidate}]"
+
+        try:
+            tree = ast.parse(candidate, mode="eval")
+        except (SyntaxError, ValueError):
+            return []
+
+        if not isinstance(tree.body, ast.List):
+            return []
+
+        calls = []
+        for elt in tree.body.elts:
+            if not isinstance(elt, ast.Call):
+                continue
+
+            name = ToolCallHandler._unparse_call_name(elt.func)
+            if not name:
+                continue
+
+            args = {}
+            ok = True
+            for kw in elt.keywords:
+                if kw.arg is None:  # skip **kwargs spreads
+                    continue
+                try:
+                    args[kw.arg] = ast.literal_eval(kw.value)
+                except (ValueError, SyntaxError):
+                    # Try unparse fallback for things like `lambda x: x+1`
+                    try:
+                        args[kw.arg] = ast.unparse(kw.value)
+                    except (AttributeError, ValueError):
+                        ok = False
+                        break
+
+            if ok and name:
+                calls.append({"name": name, "arguments": args})
+
+        return calls
+
+    @staticmethod
+    def _unparse_call_name(node):
+        """Convert ast.Name or ast.Attribute back to a dotted string."""
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            parent = ToolCallHandler._unparse_call_name(node.value)
+            if parent is None:
+                return node.attr
+            return f"{parent}.{node.attr}"
+        return None
