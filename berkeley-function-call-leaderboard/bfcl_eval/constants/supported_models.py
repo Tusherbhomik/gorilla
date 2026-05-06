@@ -189,5 +189,6 @@ SUPPORTED_MODELS = [
     "DM-Cito-32B-v1",
     "tusherbhomik/qwen2.5-1.5b-hgr-5340-r2",
     "tusherbhomik/qwen2.5-1.5b-hgr-v2-5340-final",
-    "tusherbhomik/qwen2.5-1.5b-hgr-v2-5340-final-pyparse"
+    "tusherbhomik/qwen2.5-1.5b-hgr-v2-5340-final-pyparse",
+    "tusherbhomik/qwen2.5-1.5b-hgr-5340-r2-clean2"
 ]
