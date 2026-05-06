@@ -1228,7 +1228,7 @@ local_inference_model_map = {
     ),
     "tusherbhomik/qwen2.5-1.5b-hgr-5340-r2-clean2": ModelConfig(
         model_name="tusherbhomik/qwen2.5-1.5b-hgr-5340-r2-clean2",
-        display_name="Qwen2.5-1.5B-HGR (5340-reward2) +pyparse-handler",
+        display_name="Qwen2.5-1.5B-HGR (5340-reward2) +pyparse-handler-clean2",
         url="https://huggingface.co/tusherbhomik/qwen2.5-1.5b-hgr-5340-r2-clean2",
         org="tusherbhomik",
         license="apache-2.0",
