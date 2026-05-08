@@ -1214,6 +1214,18 @@ api_inference_model_map = {
 
 # Inference through local hosting
 local_inference_model_map = {
+    "tusherbhomik/qwen2.5-1.5b-hgr-5340-r2-toolrl-reward": ModelConfig(
+        model_name="tusherbhomik/qwen2.5-1.5b-hgr-5340-r2-toolrl-reward",
+        display_name="Qwen2.5-1.5B-HGR (5340-toolrl-reward) +pyparse-handler",
+        url="https://huggingface.co/tusherbhomik/qwen2.5-1.5b-hgr-5340-r2-toolrl-reward",
+        org="tusherbhomik",
+        license="apache-2.0",
+        model_handler=ToolCallHandler,
+        input_price=None,
+        output_price=None,
+        is_fc_model=True,
+        underscore_to_dot=False,
+    ),
     "tusherbhomik/qwen2.5-1.5b-hgr-v2-5340-final-pyparse": ModelConfig(
         model_name="tusherbhomik/qwen2.5-1.5b-hgr-v2-5340-final",
         display_name="Qwen2.5-1.5B-HGR (5340-reward2) +pyparse-handler",
