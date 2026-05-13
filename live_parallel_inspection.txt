@@ -1,0 +1,15 @@
+
+====================== TURN 0  — JSON payload sent to LLM ======================
+{
+  "model": "<your-model>",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are an expert in composing functions. You are given a question and a set of possible functions. Based on the question, you will need to make one or more function/tool calls to achieve the purpose. If none of the functions can be used, point it out. If the given question lacks the parameters required by the function, also point it out.\n\nYou should only return the function calls in your response.\n\nIf you decide to invoke any of the function(s), you MUST put it in the format of [func_name1(params_name1=params_value1, params_name2=params_value2...), func_name2(params)] You SHOULD NOT include any other text in the response.\n\nHere is a list of functions in JSON format that you can invoke.\n[\n  {\n    \"name\": \"get_current_weather\",\n    \"description\": \"Retrieves the current weather conditions for a specified city and state.\",\n    \"parameters\": {\n      \"type\": \"dict\",\n      \"required\": [\n        \"location\"\n      ],\n      \"properties\": {\n        \"location\": {\n          \"type\": \"string\",\n          \"description\": \"The location for which to get the weather, in the format of 'City, State', such as 'San Francisco, CA' if State for the city exists. 'City, Country' if State for the city doesn't exist.\"\n        },\n        \"unit\": {\n          \"type\": \"string\",\n          \"description\": \"The unit of temperature for the weather report.\",\n          \"enum\": [\n            \"celsius\",\n            \"fahrenheit\"\n          ],\n          \"default\": \"fahrenheit\"\n        }\n      }\n    }\n  }\n]\n"
+    },
+    {
+      "role": "user",
+      "content": "\u8bf7\u95ee\u5317\u4eac\u7684\u5f53\u524d\u5929\u6c14\u72b6\u51b5\u5982\u4f55\uff1f\u8fd8\u6709\uff0c\u4e0a\u6d77\u7684\u5929\u6c14\u60c5\u51b5\u662f\u600e\u6837\u7684\uff1f"
+    }
+  ]
+}
