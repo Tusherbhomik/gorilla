@@ -1,10 +1,37 @@
+"""
+Custom BFCL Handler for Tusher's GRPO-trained Tool-Calling Model
+================================================================
+
+Training format recap
+---------------------
+- Model was trained on multi-turn conversations where:
+    * system   : task description + available tools (full JSON list)
+    * user     : raw user query
+    * assistant: [func_name(param=val, ...)]   <- bare Python-call list
+    * tool     : {"result": ...}               <- tool execution result (JSON string)
+
+- The model outputs tool calls in Python-call notation only:
+      [func1(a=1, b="x"), func2(c=True)]
+  There are NO <think> / <tool_call> XML tags in the training output.
+
+BFCL interface contract
+-----------------------
+Constructor : __init__(model_name, temperature, registry_name, is_fc_model,
+                       dtype="float16", **kwargs)
+Prompt      : _format_prompt(messages, function, turn_type="single_turn") -> str
+AST decode  : decode_ast(result, language, has_tool_call_tag)  -> list[dict]
+Exec decode : decode_execute(result, has_tool_call_tag)        -> list[str]
+
+Everything else (inference loop, vLLM server calls, multi-turn orchestration)
+is inherited from OSSHandler / BaseHandler in the BFCL codebase.
+"""
+
 from __future__ import annotations
 
 import ast
 import copy
 import json
 import re
-from typing import Any
 
 from bfcl_eval.model_handler.local_inference.base_oss_handler import OSSHandler
 from overrides import override
@@ -281,12 +308,7 @@ class ToolCallHandler(OSSHandler):
     # ------------------------------------------------------------------
 
     @override
-    def _format_prompt(
-        self,
-        messages: list[dict],
-        function: list[dict] | dict,
-        turn_type: str = "single_turn",
-    ) -> str:
+    def _format_prompt(self, messages, function, turn_type="single_turn"):
         """
         Build the full prompt string in the training format.
 
@@ -347,12 +369,7 @@ class ToolCallHandler(OSSHandler):
     # ------------------------------------------------------------------
 
     @override
-    def decode_ast(
-        self,
-        result: str,
-        language: str = "Python",
-        has_tool_call_tag: bool = False,
-    ) -> list[dict]:
+    def decode_ast(self, result, language="Python", has_tool_call_tag=False):
         """
         Parse raw model output into BFCL AST format.
 
@@ -386,11 +403,7 @@ class ToolCallHandler(OSSHandler):
         return decoded
 
     @override
-    def decode_execute(
-        self,
-        result: str,
-        has_tool_call_tag: bool = False,
-    ) -> list[str]:
+    def decode_execute(self, result, has_tool_call_tag=False):
         """
         Parse raw model output into executable Python call strings.
 
@@ -430,7 +443,7 @@ class ToolCallHandler(OSSHandler):
     # ------------------------------------------------------------------
 
     @override
-    def _parse_query_response_prompting(self, api_response: Any) -> dict:
+    def _parse_query_response_prompting(self, api_response):
         """Extract text + token counts from a vLLM/HF completion response."""
         model_response = api_response.choices[0].text
         return {
@@ -440,11 +453,7 @@ class ToolCallHandler(OSSHandler):
         }
 
     @override
-    def _add_assistant_message_prompting(
-        self,
-        inference_data: dict,
-        model_response_data: dict,
-    ) -> dict:
+    def _add_assistant_message_prompting(self, inference_data, model_response_data):
         """Append the assistant turn to the live conversation history."""
         inference_data["message"].append(
             {
