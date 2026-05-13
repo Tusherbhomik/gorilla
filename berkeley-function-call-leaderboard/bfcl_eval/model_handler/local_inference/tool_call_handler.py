@@ -1,34 +1,7 @@
-"""
-Custom BFCL Handler for Tusher's GRPO-trained Tool-Calling Model
-================================================================
-
-Training format recap
----------------------
-- Model was trained on multi-turn conversations where:
-    * system   : task description + available tools (JSON list)
-    * user     : query (possibly multi-turn)
-    * assistant: [func_name(param=val, ...)]   ← pure function-call string
-    * tool     : {"result": ...}               ← tool execution result (JSON)
-
-- The model outputs tool calls in Python-call notation:
-      [func1(a=1, b="x"), func2(c=True)]
-
-- No <think> / <tool_call> XML tags — just the bracketed Python-call list.
-
-BFCL interface contract
------------------------
-The handler must expose:
-    decode_ast(result, language)   → list[dict]  e.g. [{"func": {"arg": val}}]
-    decode_execute(result)         → list[str]   e.g. ["func(arg=val)"]
-    _format_prompt(messages, function, turn_type) → str
-
-Everything else (inference loop, multi-turn orchestration) is inherited from
-OSSHandler / BaseHandler in the BFCL codebase.
-"""
-
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import re
 from typing import Any
@@ -38,28 +11,72 @@ from overrides import override
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Schema / message normalisation  (carried over from ToolCallHandler)
 # ---------------------------------------------------------------------------
 
-def _build_tool_string(functions: list[dict] | dict) -> str:
-    """Convert the BFCL function spec (dict or list[dict]) to a compact
-    numbered list that was used at training time."""
+def _normalize_schema_types(tool: dict) -> dict:
+    """
+    BFCL schemas use 'dict' as the parameters type; some training data used
+    'object'.  Recursively rewrite 'dict' -> 'object' so the schema the model
+    sees at eval time matches what it learned during fine-tuning.
+    """
+    if not isinstance(tool, dict):
+        return tool
+    tool = copy.deepcopy(tool)
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("type") == "dict":
+                node["type"] = "object"
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(tool)
+    return tool
+
+
+def _normalize_tool_message(msg: dict) -> dict:
+    """
+    BFCL sometimes passes tool results without a `name` field.  Training data
+    always had {"role":"tool","name":"...","content":"..."}.  Ensure the name
+    is always present and that content is a plain string.
+    """
+    if msg.get("role") != "tool":
+        return msg
+    msg = dict(msg)
+    if not msg.get("name"):
+        msg["name"] = "tool"
+    if not isinstance(msg.get("content"), str):
+        try:
+            msg["content"] = json.dumps(msg["content"], ensure_ascii=False)
+        except Exception:
+            msg["content"] = str(msg.get("content", ""))
+    return msg
+
+
+# ---------------------------------------------------------------------------
+# Prompt helpers
+# ---------------------------------------------------------------------------
+
+def _build_tool_list_json(functions: list[dict] | dict) -> str:
+    """
+    Serialise the tool list exactly as it appeared in training system prompts:
+    a JSON array string.
+    """
     if isinstance(functions, dict):
         functions = [functions]
-
-    lines = []
-    for idx, fn in enumerate(functions, start=1):
-        params = fn.get("parameters", {}).get("properties", {})
-        lines.append(
-            f"{idx}. Name: {fn['name']}\n"
-            f"   Description: {fn.get('description', '')}\n"
-            f"   Parameters: {json.dumps(params, ensure_ascii=False)}"
-        )
-    return "\n".join(lines)
+    tools = [_normalize_schema_types(f) for f in functions if f is not None]
+    return json.dumps(tools, ensure_ascii=False, indent=2)
 
 
-def _build_system_prompt(tool_string: str) -> str:
-    """Reproduce the exact system prompt seen during training."""
+def _build_system_prompt(tool_json: str) -> str:
+    """
+    Reproduce the exact system prompt seen during training.
+    The tool list is appended verbatim as JSON so the model recognises it.
+    """
     return (
         "You are an expert in composing functions. You are given a question and "
         "a set of possible functions. Based on the question, you will need to make "
@@ -76,66 +93,40 @@ def _build_system_prompt(tool_string: str) -> str:
         "until you have fulfilled the user's request to the best of your ability. "
         "Once you have no more functions to call, the system will consider the "
         "current turn complete and proceed to the next turn or task.\n\n"
-        f"Here is a list of functions in JSON format that you can invoke.\n"
-        f"{tool_string}\n"
+        "Here is a list of functions in JSON format that you can invoke.\n"
+        f"{tool_json}\n"
     )
 
 
 # ---------------------------------------------------------------------------
-# Parsing logic
+# Output parsing helpers
 # ---------------------------------------------------------------------------
 
 def _extract_call_block(raw: str) -> str:
     """
-    Extract the bracketed call list from a model response.
+    Pull the outermost [...] block out of the raw model output.
 
-    The model outputs something like:
-        [func1(a=1, b="x"), func2(c=True)]
-    Possibly with surrounding whitespace or stray text.
+    Training taught the model to emit ONLY a bracketed list, but under
+    distribution shift it sometimes adds a brief explanation before or after.
     """
     raw = raw.strip()
 
-    # Fast path: response is already a clean bracketed list
+    # Fast path -- already a clean bracketed list
     if raw.startswith("[") and raw.endswith("]"):
         return raw
 
-    # Try to find the outermost [...] block
+    # Find the outermost [...] span (greedy -- gets the longest match)
     match = re.search(r"\[.*\]", raw, re.DOTALL)
     if match:
         return match.group(0)
 
-    return raw  # return as-is and let the parser fail gracefully
-
-
-def _parse_call_string(call_str: str) -> list[dict]:
-    """
-    Parse a bracketed Python-call string into a list of
-        {"name": str, "arguments": dict}
-    dicts.
-
-    Strategy:
-    1. Use ast.parse on the bracketed expression.
-    2. Walk each Call node to extract the function name and keyword args.
-    3. Fall back to regex-based extraction for malformed outputs.
-    """
-    call_str = call_str.strip()
-
-    # ---- primary: ast-based ------------------------------------------------
-    try:
-        tree = ast.parse(call_str, mode="eval")
-        calls = _walk_ast_calls(tree.body)
-        if calls:
-            return calls
-    except SyntaxError:
-        pass
-
-    # ---- fallback: regex ---------------------------------------------------
-    return _regex_parse_calls(call_str)
+    # Nothing found -- return as-is so downstream parsers can signal empty
+    return raw
 
 
 def _walk_ast_calls(node) -> list[dict]:
-    """Recursively collect Call nodes from an AST expression."""
-    results = []
+    """Recursively collect Call nodes from an AST expression node."""
+    results: list[dict] = []
 
     if isinstance(node, ast.List):
         for elt in node.elts:
@@ -143,15 +134,23 @@ def _walk_ast_calls(node) -> list[dict]:
         return results
 
     if isinstance(node, ast.Call):
-        name = _ast_name(node.func)
-        if name is None:
+        name = _ast_dotted_name(node.func)
+        if not name:
             return results
 
-        kwargs = {}
+        kwargs: dict = {}
         for kw in node.keywords:
-            kwargs[kw.arg] = ast.literal_eval(kw.value)
+            if kw.arg is None:        # skip **spread
+                continue
+            try:
+                kwargs[kw.arg] = ast.literal_eval(kw.value)
+            except (ValueError, TypeError):
+                try:
+                    kwargs[kw.arg] = ast.unparse(kw.value)
+                except Exception:
+                    pass              # drop unparseable arg rather than crash
 
-        # positional args – less common in BFCL but handle gracefully
+        # Positional args are uncommon in BFCL but handle defensively
         for i, arg in enumerate(node.args):
             try:
                 kwargs[f"_pos{i}"] = ast.literal_eval(arg)
@@ -164,47 +163,92 @@ def _walk_ast_calls(node) -> list[dict]:
     return results
 
 
-def _ast_name(node) -> str | None:
-    """Extract a dotted name from an AST node (handles a.b.c style)."""
+def _ast_dotted_name(node) -> str | None:
+    """Convert ast.Name / ast.Attribute back to a dotted string."""
     if isinstance(node, ast.Name):
         return node.id
     if isinstance(node, ast.Attribute):
-        parent = _ast_name(node.value)
+        parent = _ast_dotted_name(node.value)
         return f"{parent}.{node.attr}" if parent else node.attr
     return None
 
 
-# Pre-compiled regex for fallback parsing
-_FUNC_RE = re.compile(
-    r"([\w.]+)\s*\(([^()]*)\)",  # func_name(args...)
-    re.DOTALL,
-)
-_KW_RE = re.compile(r"(\w+)\s*=\s*(.+?)(?=,\s*\w+\s*=|$)", re.DOTALL)
+# Pre-compiled regex patterns for the fallback parser
+_FUNC_RE = re.compile(r"([\w.]+)\s*\(([^()]*)\)", re.DOTALL)
+_KW_RE   = re.compile(r"(\w+)\s*=\s*(.+?)(?=,\s*\w+\s*=|$)", re.DOTALL)
 
 
 def _regex_parse_calls(call_str: str) -> list[dict]:
-    """Last-resort regex parser for malformed model outputs."""
-    results = []
+    """
+    Last-resort regex parser for malformed model outputs where ast.parse
+    fails entirely (e.g. an unclosed bracket, mismatched quotes).
+    """
+    results: list[dict] = []
     for m in _FUNC_RE.finditer(call_str):
         name = m.group(1)
         args_str = m.group(2).strip()
-        kwargs = {}
+        kwargs: dict = {}
         for kw in _KW_RE.finditer(args_str):
             key = kw.group(1)
             val_str = kw.group(2).strip().rstrip(",").strip()
             try:
                 kwargs[key] = ast.literal_eval(val_str)
             except Exception:
-                kwargs[key] = val_str  # keep as string if unparseable
+                kwargs[key] = val_str   # keep raw string rather than crash
         results.append({"name": name, "arguments": kwargs})
     return results
+
+
+def _parse_call_string(call_str: str) -> list[dict]:
+    """
+    Parse a (possibly bracketed) Python-call string into a list of
+        {"name": str, "arguments": dict}
+    dicts.  Two-layer strategy:
+      1. ast.parse  -- handles all valid Python literals correctly
+      2. regex      -- handles partially malformed outputs
+    """
+    call_str = call_str.strip()
+    if not call_str:
+        return []
+
+    # Wrap a bare single call so ast can parse it as a list expression
+    candidate = call_str if call_str.startswith("[") else f"[{call_str}]"
+
+    try:
+        tree = ast.parse(candidate, mode="eval")
+        calls = _walk_ast_calls(tree.body)
+        if calls:
+            return calls
+    except (SyntaxError, ValueError):
+        pass
+
+    return _regex_parse_calls(call_str)
+
+
+def _is_no_tool_response(text: str) -> bool:
+    """
+    Return True when the model is explicitly saying no tool applies,
+    rather than emitting a broken or empty call list.
+    """
+    lower = text.lower()
+    signals = [
+        "none of the functions",
+        "no appropriate tools",
+        "cannot be used",
+        "parameters required",
+        "i cannot",
+        "i can't",
+        "no tool",
+        "not possible",
+    ]
+    return any(s in lower for s in signals)
 
 
 # ---------------------------------------------------------------------------
 # Handler
 # ---------------------------------------------------------------------------
 
-class TusherModelHandler(OSSHandler):
+class ToolCallHandler(OSSHandler):
     """
     BFCL inference handler for the GRPO-trained tool-calling model.
 
@@ -213,13 +257,24 @@ class TusherModelHandler(OSSHandler):
 
     This handler:
       1. Formats prompts in the exact style used during training.
-      2. Parses the bracketed Python-call output robustly.
+      2. Parses the bracketed Python-call output robustly (2-layer strategy).
       3. Exposes decode_ast / decode_execute for BFCL evaluation.
       4. Handles single-turn, multi-turn, and parallel tool calls.
     """
 
-    def __init__(self, model_name: str, temperature: float, **kwargs) -> None:
-        super().__init__(model_name, temperature, **kwargs)
+    def __init__(
+        self,
+        model_name: str,
+        temperature: float,
+        registry_name: str,
+        is_fc_model: bool,
+        dtype: str = "float16",
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            model_name, temperature, registry_name, is_fc_model,
+            dtype=dtype, **kwargs
+        )
 
     # ------------------------------------------------------------------
     # Prompt formatting
@@ -235,70 +290,81 @@ class TusherModelHandler(OSSHandler):
         """
         Build the full prompt string in the training format.
 
-        Structure:
+        Final structure (Qwen chat-template tokens):
             <|im_start|>system
-            {system_with_tools}
+            {system prompt including JSON tool list}
             <|im_end|>
             <|im_start|>user
-            {user_query}
+            {first user query}
             <|im_end|>
-            [... assistant / tool turns ...]
-            <|im_start|>assistant
+            [<|im_start|>assistant
+            [func(...)]
+            <|im_end|>
+            <|im_start|>user
+            <tool_response>...</tool_response>
+            <|im_end|>]  <- repeated for each tool call round
+            <|im_start|>assistant      <- generation prompt (no <|im_end|>)
         """
-        tool_string = _build_tool_string(function)
-        system_prompt = _build_system_prompt(tool_string)
+        tool_json   = _build_tool_list_json(function)
+        system_text = _build_system_prompt(tool_json)
 
-        parts: list[str] = [
-            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-        ]
+        parts: list[str] = [f"<|im_start|>system\n{system_text}<|im_end|>\n"]
 
         for msg in messages:
-            role = msg["role"]
-            content = msg.get("content", "").strip()
+            role    = msg["role"]
+            content = msg.get("content", "")
 
             if role == "system":
-                # already handled above; skip duplicate system messages
+                # System prompt already injected above; skip any extra system msg
                 continue
 
             elif role == "user":
+                content = content.strip() if isinstance(content, str) else content
                 parts.append(f"<|im_start|>user\n{content}<|im_end|>\n")
 
             elif role == "assistant":
+                content = content.strip() if isinstance(content, str) else content
                 parts.append(f"<|im_start|>assistant\n{content}<|im_end|>\n")
 
             elif role == "tool":
-                # Tool results are fed back as a user turn (mirrors training data)
-                # We wrap them clearly so the model can distinguish them.
-                tool_name = msg.get("name", "tool")
+                # Normalise tool message (ensures name + string content)
+                msg         = _normalize_tool_message(msg)
+                name        = msg.get("name", "tool")
+                tc          = msg.get("content", "")
                 result_text = (
                     f"<tool_response>\n"
-                    f"Function '{tool_name}' returned:\n{content}\n"
+                    f"Function '{name}' returned:\n{tc}\n"
                     f"</tool_response>"
                 )
                 parts.append(f"<|im_start|>user\n{result_text}<|im_end|>\n")
 
-        # Generation prompt
+        # Append generation prompt -- no closing <|im_end|>
         parts.append("<|im_start|>assistant\n")
         return "".join(parts)
 
     # ------------------------------------------------------------------
-    # Output parsing
+    # Output decoding
     # ------------------------------------------------------------------
 
     @override
-    def decode_ast(self, result: str, language: str = "Python") -> list[dict]:
+    def decode_ast(
+        self,
+        result: str,
+        language: str = "Python",
+        has_tool_call_tag: bool = False,
+    ) -> list[dict]:
         """
-        Parse model output into BFCL AST format.
+        Parse raw model output into BFCL AST format.
 
         Returns:
-            list of { func_name: { arg_name: arg_value } }
+            [ { func_name: { arg_name: arg_value } }, ... ]
             e.g. [{"add": {"a": 1, "b": 2}}]
 
-        Returns [] if no valid tool calls are detected.
+        Returns [] for empty output, prose-only output, or explicit
+        "no tool available" replies.
         """
         call_block = _extract_call_block(result)
 
-        # Detect explicit "no tool" signals
         if _is_no_tool_response(call_block):
             return []
 
@@ -306,29 +372,35 @@ class TusherModelHandler(OSSHandler):
         if not parsed:
             return []
 
-        # Convert to BFCL's expected AST format
         decoded: list[dict] = []
         for call in parsed:
             name = call["name"].strip()
-            args = call.get("arguments", {})
-
-            # Skip explicit None-tool placeholders
             if name.lower() in ("none", "null", ""):
                 continue
-
+            args = {
+                k: v for k, v in call.get("arguments", {}).items()
+                if not k.startswith("_pos")          # drop positional placeholders
+            }
             decoded.append({name: args})
 
         return decoded
 
     @override
-    def decode_execute(self, result: str) -> list[str]:
+    def decode_execute(
+        self,
+        result: str,
+        has_tool_call_tag: bool = False,
+    ) -> list[str]:
         """
-        Parse model output into executable Python call strings.
+        Parse raw model output into executable Python call strings.
 
         Returns:
-            list of strings like ["func(a=1, b='x')"]
+            [ "func(a=1, b='x')", ... ]
 
-        Returns [] if no valid tool calls are detected.
+        Returns [] for empty / no-tool outputs.
+
+        Note: dotted names are preserved (e.g. "GorillaFileSystem.ls") because
+        multi-turn eval injects the class instance into the execution namespace.
         """
         call_block = _extract_call_block(result)
 
@@ -344,27 +416,27 @@ class TusherModelHandler(OSSHandler):
             name = call["name"].strip()
             if name.lower() in ("none", "null", ""):
                 continue
-            args = call.get("arguments", {})
-            args_str = ", ".join(
-                f"{k}={repr(v)}" for k, v in args.items()
-                if not k.startswith("_pos")  # skip anonymous positional args
-            )
+            args = {
+                k: v for k, v in call.get("arguments", {}).items()
+                if not k.startswith("_pos")
+            }
+            args_str = ", ".join(f"{k}={repr(v)}" for k, v in args.items())
             executable.append(f"{name}({args_str})")
 
         return executable
 
     # ------------------------------------------------------------------
-    # Response parsing (for multi-turn inference loop)
+    # Inference plumbing  (multi-turn / vLLM completion API)
     # ------------------------------------------------------------------
 
     @override
     def _parse_query_response_prompting(self, api_response: Any) -> dict:
-        """Extract text from a vLLM/HF completion response."""
+        """Extract text + token counts from a vLLM/HF completion response."""
         model_response = api_response.choices[0].text
         return {
             "model_responses": model_response,
-            "input_token": api_response.usage.prompt_tokens,
-            "output_token": api_response.usage.completion_tokens,
+            "input_token":     api_response.usage.prompt_tokens,
+            "output_token":    api_response.usage.completion_tokens,
         }
 
     @override
@@ -373,35 +445,11 @@ class TusherModelHandler(OSSHandler):
         inference_data: dict,
         model_response_data: dict,
     ) -> dict:
-        """Append the assistant message to conversation history."""
+        """Append the assistant turn to the live conversation history."""
         inference_data["message"].append(
             {
-                "role": "assistant",
+                "role":    "assistant",
                 "content": model_response_data["model_responses"],
             }
         )
         return inference_data
-
-
-# ---------------------------------------------------------------------------
-# Utility
-# ---------------------------------------------------------------------------
-
-def _is_no_tool_response(text: str) -> bool:
-    """
-    Detect when the model explicitly says no tool is applicable.
-    Training data included phrases like:
-        "None of the functions can be used"
-        "parameters required by the function"
-    """
-    lower = text.lower()
-    signals = [
-        "none of the functions",
-        "no appropriate tools",
-        "cannot be used",
-        "parameters required",
-        "i cannot",
-        "i can't",
-        "no tool",
-    ]
-    return any(s in lower for s in signals)
